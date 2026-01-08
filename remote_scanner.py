@@ -30,3 +30,14 @@ def get_auth_token(imageName):
         sys.exit(1)
     return r.json()['token']
 
+def get_manifest(imageName, token):
+    #This function helps by returning a json containing the list of all layers of the image from OS to the latest added file
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.docker.distribution.manifest.v2+json"
+    }
+
+    url = f"{REGISTRY_URL}/library/{imageName}/manifests/latest"
+    r = requests.get(url, headers = headers)
+
+    return r.json()
