@@ -11,10 +11,20 @@ load_dotenv()
 #This is where the docker hub token will go
 DOCKER_USER = os.getenv("DOCKER_USER")
 DOCKER_PAT = os.getenv("DOCKER_PASSWORD")
-TARGET_IMAGE = "alpine"
+TARGET_IMAGE = "alpine:3.10"
 
 REGISTRY_URL = "https://registry-1.docker.io/v2"
 AUTH_URL = "https://auth.docker.io/token"
+
+def parse_image_reference(image_ref):
+    """Parse image:tag into (image_name, tag)"""
+    if ':' in image_ref:
+        name, tag = image_ref.split(':', 1)
+    else:
+        name, tag = image_ref, 'latest'
+    return name, tag
+
+IMAGE_NAME, IMAGE_TAG = parse_image_reference(TARGET_IMAGE)
 
 def get_auth_token(imageName):
     #All this function does is to basically authenticate in docker hub so we can read images freely
@@ -32,14 +42,14 @@ def get_auth_token(imageName):
         sys.exit(1)
     return r.json()['token']
 
-def get_manifest(imageName, token):
+def get_manifest(imageName, tag, token):
     #This function helps by returning a json containing the list of all layers of the image from OS to the latest added file
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json"
     }
 
-    url = f"{REGISTRY_URL}/library/{imageName}/manifests/latest"
+    url = f"{REGISTRY_URL}/library/{imageName}/manifests/{tag}"
     r = requests.get(url, headers=headers)
     manifest = r.json()
 
@@ -107,12 +117,13 @@ def parse_apk(content):
     return packages
 
 def main():
+    print(f"Scanning image: {TARGET_IMAGE}")
     print(f"Authenticating as user: {DOCKER_USER}")
-    token = get_auth_token(TARGET_IMAGE)
+    token = get_auth_token(IMAGE_NAME)
     print(f"Authenticated successfully")
 
     print("Fetching manifest...")
-    manifest = get_manifest(TARGET_IMAGE, token)
+    manifest = get_manifest(IMAGE_NAME, IMAGE_TAG, token)
 
     if 'layers' not in manifest:
         print("Error: Failed to read the layers. Image might be of a different format")
@@ -126,7 +137,7 @@ def main():
         digest = layer['digest']
         print(f" > Stream layer {digest[:12]}.. ", end = "", flush = True)
 
-        content = scan_layer_stream(digest,token,TARGET_IMAGE)
+        content = scan_layer_stream(digest, token, IMAGE_NAME)
         if content:
             inventory.extend(parse_apk(content))
             break
