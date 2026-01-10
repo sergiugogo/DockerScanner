@@ -4,6 +4,7 @@ import io
 import gzip
 import sys
 import os
+import re
 import argparse
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ REGISTRY_URL = "https://registry-1.docker.io/v2"
 AUTH_URL = "https://auth.docker.io/token"
 
 # Mapping of file paths to OS types for package detection
-TARGET_FILES = {
+OS_PACKAGE_FILES = {
     "lib/apk/db/installed": "Alpine",
     "var/lib/dpkg/status": "Debian"
 }
@@ -84,27 +85,43 @@ def get_manifest(imageName, tag, token):
     return manifest
 
 def scan_layer_stream(layerDigest, token, imageName):
-    """Scan a layer for package database files.
+    """Scan a layer for package database files and application dependency files.
     
     Returns:
-        tuple: (content, os_type) if a package file is found, (None, None) otherwise
+        list: List of tuples (content, file_type, metadata)
+              file_type is 'os' or 'app'
+              metadata contains os_type for OS files, or app_type for app files
     """
+    findings = []
     headers = {
-        "Authorization" : f"Bearer {token}"}
+        "Authorization": f"Bearer {token}"}
     url = f"{REGISTRY_URL}/library/{imageName}/blobs/{layerDigest}"
 
-    with requests.get(url, headers = headers, stream= True) as r:
+    with requests.get(url, headers=headers, stream=True) as r:
         try:
-            with gzip.GzipFile(fileobj = r.raw) as gzfile:
-                with tarfile.open(fileobj = gzfile, mode = 'r|*') as tar:
+            with gzip.GzipFile(fileobj=r.raw) as gzfile:
+                with tarfile.open(fileobj=gzfile, mode='r|*') as tar:
                     for member in tar:
+                        if not member.isfile():
+                            continue
+                        
                         cleanName = member.name.lstrip('./')
-                        # Check if this file matches any of our target paths
-                        if cleanName in TARGET_FILES:
-                            os_type = TARGET_FILES[cleanName]
-                            print(f"Found {os_type} package file in layer {layerDigest[:12]}")
+                        
+                        # Check for OS package database files
+                        if cleanName in OS_PACKAGE_FILES:
+                            os_type = OS_PACKAGE_FILES[cleanName]
+                            print(f"\n   Found {os_type} package DB")
                             f = tar.extractfile(member)
-                            return f.read().decode('utf-8'), os_type
+                            content = f.read().decode('utf-8')
+                            findings.append((content, 'os', os_type))
+                        
+                        # Check for Python requirements.txt
+                        elif cleanName.endswith('requirements.txt'):
+                            print(f"\n   Found requirements.txt: {cleanName}")
+                            f = tar.extractfile(member)
+                            content = f.read().decode('utf-8')
+                            findings.append((content, 'app', 'python'))
+                            
         except gzip.BadGzipFile:
             pass
         except tarfile.ReadError as e:
@@ -112,7 +129,7 @@ def scan_layer_stream(layerDigest, token, imageName):
         except requests.RequestException as e:
             print(f"Error: Network error for layer {layerDigest[:12]}: {e}")
 
-    return None, None
+    return findings
 
 
 def parse_apk(content):
@@ -171,14 +188,68 @@ def parse_dpkg(content):
     
     return packages
 
+
+def parse_requirements(content):
+    """Parse Python requirements.txt file.
+    
+    Handles formats like:
+        flask==2.0.1
+        requests>=2.25.0
+        numpy
+        # comments
+        -e git+https://...
+    
+    Returns:
+        list: List of dicts with 'name', 'version', and 'type' keys
+    """
+    packages = []
+    # Regex to match package specs: name followed by optional version specifier
+    # Matches: flask==2.0.1, requests>=2.25, numpy, django<4.0, etc.
+    pattern = re.compile(r'^([a-zA-Z0-9_-]+)\s*([=<>!~]+)?\s*([a-zA-Z0-9._-]+)?')
+    
+    for line in content.splitlines():
+        line = line.strip()
+        
+        # Skip empty lines and comments
+        if not line or line.startswith('#'):
+            continue
+        
+        # Skip editable installs, URLs, and other special formats
+        if line.startswith('-') or line.startswith('git+') or '://' in line:
+            continue
+        
+        # Remove inline comments
+        if '#' in line:
+            line = line.split('#')[0].strip()
+        
+        # Remove environment markers (e.g., ; python_version >= "3.6")
+        if ';' in line:
+            line = line.split(';')[0].strip()
+        
+        # Remove extras (e.g., package[extra1,extra2])
+        if '[' in line:
+            line = re.sub(r'\[.*?\]', '', line)
+        
+        match = pattern.match(line)
+        if match:
+            name = match.group(1)
+            version = match.group(3) if match.group(3) else 'unspecified'
+            packages.append({
+                'name': name,
+                'version': version,
+                'type': 'python'
+            })
+    
+    return packages
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(
-        description="Scan Docker images for installed packages (Alpine/Debian/Ubuntu)"
+        description="Scan Docker images for installed packages (Alpine/Debian/Ubuntu) and app dependencies"
     )
     parser.add_argument(
         "image_input",
-        help="Docker image to scan (e.g., alpine:3.10, nginx:latest, ubuntu:22.04)"
+        help="Docker image to scan (e.g., alpine:3.10, nginx:latest, python:3.9)"
     )
     args = parser.parse_args()
 
@@ -200,39 +271,54 @@ def main():
     layers = manifest['layers']
     print(f"Found {len(layers)} layers")
 
-    inventory = []
+    # Collect packages from all layers
+    os_packages = []
+    app_packages = []
     detected_os = None
     
     for layer in reversed(layers):
         digest = layer['digest']
-        print(f" > Stream layer {digest[:12]}.. ", end="", flush=True)
+        print(f" > Scanning layer {digest[:12]}.. ", end="", flush=True)
 
-        content, os_type = scan_layer_stream(digest, token, image_name)
-        if content:
-            detected_os = os_type
-            # Select the appropriate parser based on detected OS
-            if os_type == "Alpine":
-                inventory.extend(parse_apk(content))
-            elif os_type == "Debian":
-                inventory.extend(parse_dpkg(content))
-            break
-        else:
-            print("Content is empty")
+        findings = scan_layer_stream(digest, token, image_name)
+        
+        if not findings:
+            print("(empty)")
+            continue
+        
+        for content, file_type, metadata in findings:
+            if file_type == 'os' and not detected_os:
+                # Only use the first OS package DB found (most recent layer)
+                detected_os = metadata
+                if metadata == "Alpine":
+                    os_packages.extend(parse_apk(content))
+                elif metadata == "Debian":
+                    os_packages.extend(parse_dpkg(content))
+            elif file_type == 'app':
+                if metadata == 'python':
+                    app_packages.extend(parse_requirements(content))
+        
+        print("")
 
-    if inventory and detected_os:
-        print(f"Detected OS: {detected_os}")
-        print(f"Found {len(inventory)} packages.")
+    # Build and save the inventory
+    if os_packages or app_packages:
+        print(f"\n=== Scan Results ===")
+        if detected_os:
+            print(f"Detected OS: {detected_os}")
+            print(f"OS packages found: {len(os_packages)}")
+        print(f"App packages found: {len(app_packages)}")
         
         import json
         result = {
-            "ecosystem": detected_os,
-            "packages": inventory
+            "os": detected_os,
+            "os_packages": os_packages,
+            "app_packages": app_packages
         }
         with open("inventory.json", "w") as f:
             json.dump(result, f, indent=2)
-        print("Inventory saved to inventory.json")
+        print("\nInventory saved to inventory.json")
     else:
-        print("Failed to save the inventory.")
+        print("No packages found in the image.")
 
 if __name__ == "__main__":
     main()
