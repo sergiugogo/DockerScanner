@@ -3,7 +3,8 @@ import tarfile
 import io
 import gzip
 import sys
-import os 
+import os
+import argparse
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 load_dotenv()
@@ -11,10 +12,16 @@ load_dotenv()
 #This is where the docker hub token will go
 DOCKER_USER = os.getenv("DOCKER_USER")
 DOCKER_PAT = os.getenv("DOCKER_PASSWORD")
-TARGET_IMAGE = "alpine:3.10"
 
 REGISTRY_URL = "https://registry-1.docker.io/v2"
 AUTH_URL = "https://auth.docker.io/token"
+
+# Mapping of file paths to OS types for package detection
+TARGET_FILES = {
+    "lib/apk/db/installed": "Alpine",
+    "var/lib/dpkg/status": "Debian"
+}
+
 
 def parse_image_reference(image_ref):
     """Parse image:tag into (image_name, tag)"""
@@ -23,8 +30,6 @@ def parse_image_reference(image_ref):
     else:
         name, tag = image_ref, 'latest'
     return name, tag
-
-IMAGE_NAME, IMAGE_TAG = parse_image_reference(TARGET_IMAGE)
 
 def get_auth_token(imageName):
     #All this function does is to basically authenticate in docker hub so we can read images freely
@@ -79,6 +84,11 @@ def get_manifest(imageName, tag, token):
     return manifest
 
 def scan_layer_stream(layerDigest, token, imageName):
+    """Scan a layer for package database files.
+    
+    Returns:
+        tuple: (content, os_type) if a package file is found, (None, None) otherwise
+    """
     headers = {
         "Authorization" : f"Bearer {token}"}
     url = f"{REGISTRY_URL}/library/{imageName}/blobs/{layerDigest}"
@@ -88,10 +98,13 @@ def scan_layer_stream(layerDigest, token, imageName):
             with gzip.GzipFile(fileobj = r.raw) as gzfile:
                 with tarfile.open(fileobj = gzfile, mode = 'r|*') as tar:
                     for member in tar:
-                        if member.name == "lib/apk/db/installed":
-                            print(f"Found apk installed file in layer {layerDigest[:12]}")
+                        cleanName = member.name.lstrip('./')
+                        # Check if this file matches any of our target paths
+                        if cleanName in TARGET_FILES:
+                            os_type = TARGET_FILES[cleanName]
+                            print(f"Found {os_type} package file in layer {layerDigest[:12]}")
                             f = tar.extractfile(member)
-                            return f.read().decode('utf-8')
+                            return f.read().decode('utf-8'), os_type
         except gzip.BadGzipFile:
             pass
         except tarfile.ReadError as e:
@@ -99,31 +112,86 @@ def scan_layer_stream(layerDigest, token, imageName):
         except requests.RequestException as e:
             print(f"Error: Network error for layer {layerDigest[:12]}: {e}")
 
-    return None
+    return None, None
 
 
 def parse_apk(content):
+    """Parse Alpine APK installed database.
+    
+    Returns:
+        list: List of dicts with 'name' and 'version' keys
+    """
     packages = []
     current = {}
     for line in content.splitlines():
         line = line.strip()
         if not line:
-            if 'P' in current: packages.append(current)
+            if 'P' in current and 'V' in current:
+                packages.append({
+                    'name': current['P'],
+                    'version': current['V']
+                })
             current = {}
             continue
         if len(line) > 2 and line[1] == ':':
             current[line[0]] = line[2:]
-    if 'P' in current: packages.append(current)
+    if 'P' in current and 'V' in current:
+        packages.append({
+            'name': current['P'],
+            'version': current['V']
+        })
+    return packages
+
+
+def parse_dpkg(content):
+    """Parse Debian/Ubuntu dpkg status file.
+    
+    Returns:
+        list: List of dicts with 'name' and 'version' keys
+    """
+    packages = []
+    current = {}
+    
+    for line in content.splitlines():
+        if not line.strip():
+            # Empty line marks end of a block
+            if 'name' in current and 'version' in current:
+                packages.append(current)
+            current = {}
+            continue
+        
+        if line.startswith("Package: "):
+            current['name'] = line[9:].strip()
+        elif line.startswith("Version: "):
+            current['version'] = line[9:].strip()
+    
+    # Don't forget the last block if file doesn't end with empty line
+    if 'name' in current and 'version' in current:
+        packages.append(current)
+    
     return packages
 
 def main():
-    print(f"Scanning image: {TARGET_IMAGE}")
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Scan Docker images for installed packages (Alpine/Debian/Ubuntu)"
+    )
+    parser.add_argument(
+        "image_input",
+        help="Docker image to scan (e.g., alpine:3.10, nginx:latest, ubuntu:22.04)"
+    )
+    args = parser.parse_args()
+
+    # Parse the image reference into name and tag
+    image_name, image_tag = parse_image_reference(args.image_input)
+
+    print(f"Scanning image: {args.image_input}")
     print(f"Authenticating as user: {DOCKER_USER}")
-    token = get_auth_token(IMAGE_NAME)
+    token = get_auth_token(image_name)
     print(f"Authenticated successfully")
 
     print("Fetching manifest...")
-    manifest = get_manifest(IMAGE_NAME, IMAGE_TAG, token)
+    manifest = get_manifest(image_name, image_tag, token)
 
     if 'layers' not in manifest:
         print("Error: Failed to read the layers. Image might be of a different format")
@@ -133,22 +201,35 @@ def main():
     print(f"Found {len(layers)} layers")
 
     inventory = []
+    detected_os = None
+    
     for layer in reversed(layers):
         digest = layer['digest']
-        print(f" > Stream layer {digest[:12]}.. ", end = "", flush = True)
+        print(f" > Stream layer {digest[:12]}.. ", end="", flush=True)
 
-        content = scan_layer_stream(digest, token, IMAGE_NAME)
+        content, os_type = scan_layer_stream(digest, token, image_name)
         if content:
-            inventory.extend(parse_apk(content))
+            detected_os = os_type
+            # Select the appropriate parser based on detected OS
+            if os_type == "Alpine":
+                inventory.extend(parse_apk(content))
+            elif os_type == "Debian":
+                inventory.extend(parse_dpkg(content))
             break
         else:
             print("Content is empty")
 
-    if inventory:
+    if inventory and detected_os:
+        print(f"Detected OS: {detected_os}")
         print(f"Found {len(inventory)} packages.")
+        
         import json
+        result = {
+            "ecosystem": detected_os,
+            "packages": inventory
+        }
         with open("inventory.json", "w") as f:
-            json.dump(inventory, f, indent = 2)
+            json.dump(result, f, indent=2)
         print("Inventory saved to inventory.json")
     else:
         print("Failed to save the inventory.")
