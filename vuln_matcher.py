@@ -51,13 +51,14 @@ def check_vulnerabilities(packageName, version, ecosystem):
         print(f"Network error for {packageName}: {e}")
         return []
     
-def scan_packages(packages, ecosystem, category_name):
+def scan_packages(packages, ecosystem, category_name, pkg_type=None):
     """Scan a list of packages for vulnerabilities.
     
     Args:
         packages: List of package dicts with 'name' and 'version' keys
         ecosystem: The ecosystem to use for OSV queries
         category_name: Display name for this category (e.g., 'OS', 'Application')
+        pkg_type: Optional package type (e.g., 'python', 'npm', 'go')
     
     Returns:
         tuple: (stats dict, list of found vulnerabilities)
@@ -72,6 +73,7 @@ def scan_packages(packages, ecosystem, category_name):
     for item in packages:
         pkg_name = item.get("name")
         pkg_version = item.get("version")
+        item_type = item.get("type", pkg_type)  # Use item's type or fallback to passed type
         
         if not pkg_name or not pkg_version:
             continue
@@ -91,6 +93,7 @@ def scan_packages(packages, ecosystem, category_name):
                 "name": pkg_name,
                 "version": pkg_version,
                 "category": category_name,
+                "pkg_type": item_type,
                 "issues": vulns
             })
             print(f"  VULNERABLE: {pkg_name} v{pkg_version}")
@@ -100,13 +103,21 @@ def scan_packages(packages, ecosystem, category_name):
     return stats, found_vulns
 
 
-def print_vulnerabilities(vulns, category_name):
-    """Print vulnerability details for a category."""
-    category_vulns = [v for v in vulns if v["category"] == category_name]
+def print_vulnerabilities(vulns, category_name, pkg_type=None):
+    """Print vulnerability details for a category.
+    
+    Args:
+        vulns: List of vulnerability findings
+        category_name: Category to filter by ('OS' or 'Application')
+        pkg_type: Optional package type to filter by ('python', 'npm', 'go')
+    """
+    if pkg_type:
+        category_vulns = [v for v in vulns if v["category"] == category_name and v.get("pkg_type") == pkg_type]
+    else:
+        category_vulns = [v for v in vulns if v["category"] == category_name]
     
     if not category_vulns:
-        print(f"  No {category_name.lower()} vulnerabilities found.")
-        return
+        return 0
     
     print(f"  Found {len(category_vulns)} vulnerable packages:")
     for item in category_vulns:
@@ -116,6 +127,8 @@ def print_vulnerabilities(vulns, category_name):
             summary = v.get('summary', 'No description available')
             print(f"    - {cve_id}: {summary[:80]}...")
             print(f"      Link: https://osv.dev/vulnerability/{cve_id}")
+    
+    return len(category_vulns)
 
 
 def main():
@@ -162,16 +175,37 @@ def main():
     # --- Application Package Scanning ---
     if app_packages:
         print("\n--- Application Package Scanning ---")
-        print("Using ecosystem: PyPI")
         print("-" * 40)
         
-        app_stats, app_vulns = scan_packages(app_packages, "PyPI", "Application")
-        all_vulns.extend(app_vulns)
+        # Group packages by type for correct ecosystem mapping
+        # OSV ecosystem names: PyPI for Python, npm for Node.js, Go for Go, Maven for Java
+        ecosystem_map = {
+            'python': 'PyPI',
+            'npm': 'npm',
+            'go': 'Go',
+            'maven': 'Maven'
+        }
         
-        for key in total_stats:
-            total_stats[key] += app_stats[key]
+        # Group packages by their type
+        packages_by_type = {}
+        for pkg in app_packages:
+            pkg_type = pkg.get('type', 'unknown')
+            if pkg_type not in packages_by_type:
+                packages_by_type[pkg_type] = []
+            packages_by_type[pkg_type].append(pkg)
         
-        print(f"\nApp Scan Complete: {app_stats['checked']} checked, {app_stats['vulnerable']} vulnerable")
+        # Scan each group with its correct ecosystem
+        for pkg_type, pkgs in packages_by_type.items():
+            ecosystem = ecosystem_map.get(pkg_type, pkg_type)
+            print(f"\n  [{pkg_type.upper()}] Scanning {len(pkgs)} packages (ecosystem: {ecosystem})")
+            
+            app_stats, app_vulns = scan_packages(pkgs, ecosystem, "Application", pkg_type)
+            all_vulns.extend(app_vulns)
+            
+            for key in total_stats:
+                total_stats[key] += app_stats[key]
+        
+        print(f"\nApp Scan Complete: {total_stats['checked'] - (os_stats['checked'] if os_packages and os_ecosystem else 0)} app packages checked")
     else:
         print("\n--- Application Package Scanning ---")
         print("Skipped: No application packages found")
@@ -182,11 +216,33 @@ def main():
     print("=" * 60)
     
     if all_vulns:
+        # Print OS Vulnerabilities
         print("\n[OS Vulnerabilities]")
-        print_vulnerabilities(all_vulns, "OS")
+        os_count = print_vulnerabilities(all_vulns, "OS")
+        if os_count == 0:
+            print("  No OS vulnerabilities found.")
         
+        # Print Application Vulnerabilities grouped by language
         print("\n[Application Vulnerabilities]")
-        print_vulnerabilities(all_vulns, "Application")
+        
+        # Language display names
+        language_names = {
+            'python': 'Python',
+            'npm': 'Node.js', 
+            'go': 'Go',
+            'maven': 'Java/Maven'
+        }
+        
+        app_total = 0
+        for pkg_type, display_name in language_names.items():
+            type_vulns = [v for v in all_vulns if v["category"] == "Application" and v.get("pkg_type") == pkg_type]
+            if type_vulns:
+                print(f"\n  --- {display_name} Vulnerabilities ---")
+                count = print_vulnerabilities(all_vulns, "Application", pkg_type)
+                app_total += count
+        
+        if app_total == 0:
+            print("  No application vulnerabilities found.")
     else:
         print("\nNo vulnerabilities found in any packages!")
     

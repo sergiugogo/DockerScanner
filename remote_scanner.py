@@ -5,7 +5,9 @@ import gzip
 import sys
 import os
 import re
+import json
 import argparse
+import xml.etree.ElementTree as ET
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 load_dotenv()
@@ -121,6 +123,29 @@ def scan_layer_stream(layerDigest, token, imageName):
                             f = tar.extractfile(member)
                             content = f.read().decode('utf-8')
                             findings.append((content, 'app', 'python'))
+                        
+                        # Check for Node.js package.json
+                        elif cleanName.endswith('package.json'):
+                            # Skip node_modules package.json files
+                            if 'node_modules' not in cleanName:
+                                print(f"\n   Found package.json: {cleanName}")
+                                f = tar.extractfile(member)
+                                content = f.read().decode('utf-8')
+                                findings.append((content, 'app', 'npm'))
+                        
+                        # Check for Go go.mod
+                        elif cleanName.endswith('go.mod'):
+                            print(f"\n   Found go.mod: {cleanName}")
+                            f = tar.extractfile(member)
+                            content = f.read().decode('utf-8')
+                            findings.append((content, 'app', 'go'))
+                        
+                        # Check for Java/Maven pom.xml
+                        elif cleanName.endswith('pom.xml'):
+                            print(f"\n   Found pom.xml: {cleanName}")
+                            f = tar.extractfile(member)
+                            content = f.read().decode('utf-8')
+                            findings.append((content, 'app', 'maven'))
                             
         except gzip.BadGzipFile:
             pass
@@ -242,6 +267,187 @@ def parse_requirements(content):
     
     return packages
 
+
+def parse_package_json(content):
+    """Parse Node.js package.json file.
+    
+    Extracts dependencies from the 'dependencies' and 'devDependencies' keys.
+    Cleans version strings by removing ^ and ~ prefixes.
+    
+    Returns:
+        list: List of dicts with 'name', 'version', and 'type' keys
+    """
+    packages = []
+    
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return packages
+    
+    # Process both dependencies and devDependencies
+    for dep_key in ['dependencies', 'devDependencies']:
+        deps = data.get(dep_key, {})
+        if not isinstance(deps, dict):
+            continue
+            
+        for name, version in deps.items():
+            # Clean version string: remove ^, ~, and other prefixes
+            clean_version = version.lstrip('^~>=<')
+            
+            # Skip versions that are URLs, git refs, or file paths
+            if '://' in version or version.startswith('git') or version.startswith('file:'):
+                clean_version = 'unspecified'
+            
+            # Handle version ranges like "1.0.0 - 2.0.0" - take the first version
+            if ' - ' in clean_version:
+                clean_version = clean_version.split(' - ')[0]
+            
+            # Handle versions with spaces like ">= 1.0.0" - take the version part
+            if ' ' in clean_version:
+                clean_version = clean_version.split()[-1]
+            
+            packages.append({
+                'name': name,
+                'version': clean_version if clean_version else 'unspecified',
+                'type': 'npm'
+            })
+    
+    return packages
+
+
+def parse_go_mod(content):
+    """Parse Go go.mod file.
+    
+    Looks for require statements and extracts module names and versions.
+    Handles both single-line and block require statements.
+    
+    Returns:
+        list: List of dicts with 'name', 'version', and 'type' keys
+    """
+    packages = []
+    in_require_block = False
+    
+    for line in content.splitlines():
+        line = line.strip()
+        
+        # Skip empty lines and comments
+        if not line or line.startswith('//'):
+            continue
+        
+        # Check for require block start
+        if line.startswith('require ('):
+            in_require_block = True
+            continue
+        
+        # Check for require block end
+        if in_require_block and line == ')':
+            in_require_block = False
+            continue
+        
+        # Handle single-line require: require github.com/pkg/errors v0.9.1
+        if line.startswith('require ') and '(' not in line:
+            parts = line.split()
+            if len(parts) >= 3:
+                module = parts[1]
+                version = parts[2].lstrip('v')  # Remove 'v' prefix
+                packages.append({
+                    'name': module,
+                    'version': version,
+                    'type': 'go'
+                })
+        
+        # Handle lines inside require block
+        elif in_require_block:
+            # Remove inline comments
+            if '//' in line:
+                line = line.split('//')[0].strip()
+            
+            parts = line.split()
+            if len(parts) >= 2:
+                module = parts[0]
+                version = parts[1].lstrip('v')  # Remove 'v' prefix
+                
+                # Skip indirect dependencies if marked
+                # (they're still valid, but you could filter them if needed)
+                
+                packages.append({
+                    'name': module,
+                    'version': version,
+                    'type': 'go'
+                })
+    
+    return packages
+
+
+def parse_pom_xml(content):
+    """Parse Java/Maven pom.xml file.
+    
+    Extracts dependencies from Maven POM files.
+    Handles XML namespaces dynamically.
+    
+    Returns:
+        list: List of dicts with 'name', 'version', and 'type' keys
+              Name is formatted as 'groupId:artifactId'
+    """
+    packages = []
+    
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        # If XML parsing fails, skip this file
+        return packages
+    
+    # Handle Maven namespace - extract it dynamically from root tag
+    # Root tag might be like '{http://maven.apache.org/POM/4.0.0}project'
+    namespace = ''
+    if root.tag.startswith('{'):
+        namespace = root.tag.split('}')[0] + '}'
+    
+    # Find all dependency elements
+    # Try both with and without namespace
+    dependencies = root.findall(f'.//{namespace}dependency')
+    
+    # If no dependencies found with namespace, try without
+    if not dependencies:
+        dependencies = root.findall('.//dependency')
+    
+    for dep in dependencies:
+        # Extract groupId, artifactId, and version
+        group_id_elem = dep.find(f'{namespace}groupId') if namespace else dep.find('groupId')
+        artifact_id_elem = dep.find(f'{namespace}artifactId') if namespace else dep.find('artifactId')
+        version_elem = dep.find(f'{namespace}version') if namespace else dep.find('version')
+        
+        # Fallback without namespace if not found
+        if group_id_elem is None:
+            group_id_elem = dep.find('groupId')
+        if artifact_id_elem is None:
+            artifact_id_elem = dep.find('artifactId')
+        if version_elem is None:
+            version_elem = dep.find('version')
+        
+        group_id = group_id_elem.text if group_id_elem is not None else None
+        artifact_id = artifact_id_elem.text if artifact_id_elem is not None else None
+        version = version_elem.text if version_elem is not None else 'unspecified'
+        
+        # Skip if we don't have the essential identifiers
+        if not group_id or not artifact_id:
+            continue
+        
+        # Skip property placeholders like ${project.version}
+        if version and version.startswith('${'):
+            version = 'unspecified'
+        
+        # Construct Maven-style package name: groupId:artifactId
+        package_name = f"{group_id}:{artifact_id}"
+        
+        packages.append({
+            'name': package_name,
+            'version': version if version else 'unspecified',
+            'type': 'maven'
+        })
+    
+    return packages
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(
@@ -297,6 +503,12 @@ def main():
             elif file_type == 'app':
                 if metadata == 'python':
                     app_packages.extend(parse_requirements(content))
+                elif metadata == 'npm':
+                    app_packages.extend(parse_package_json(content))
+                elif metadata == 'go':
+                    app_packages.extend(parse_go_mod(content))
+                elif metadata == 'maven':
+                    app_packages.extend(parse_pom_xml(content))
         
         print("")
 
