@@ -18,7 +18,7 @@ Documentatie.md
 
 # Generated output files
 inventory.json
-
+*.pdf
 # IDE settings
 .vscode/
 .idea/

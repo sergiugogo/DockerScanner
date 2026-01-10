@@ -1,0 +1,14 @@
+# DockerScanner Dependencies
+# Install with: pip install -r requirements.txt
+
+# HTTP requests for Docker Hub and OSV APIs
+requests>=2.28.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# HTML templating for reports
+Jinja2>=3.1.0
+
+# PDF generation from HTML
+xhtml2pdf>=0.2.15

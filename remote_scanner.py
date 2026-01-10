@@ -25,6 +25,46 @@ OS_PACKAGE_FILES = {
     "var/lib/dpkg/status": "Debian"
 }
 
+# Secret scanning configuration
+SUSPICIOUS_FILENAMES = [
+    ".env",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".npmrc",
+    ".aws/credentials",
+    "secrets.yaml",
+    "secrets.yml",
+    ".docker/config.json",
+    ".netrc",
+    ".pgpass"
+]
+
+SECRET_REGEX_PATTERNS = {
+    "AWS Access Key": r"AKIA[0-9A-Z]{16}",
+    "AWS Secret Key": r"(?i)aws(.{0,20})?['\"][0-9a-zA-Z/+]{40}['\"]",
+    "Generic Private Key": r"-----BEGIN (RSA|EC|DSA|OPENSSH|PGP) PRIVATE KEY-----",
+    "GitHub Token": r"ghp_[0-9a-zA-Z]{36}",
+    "GitHub OAuth": r"gho_[0-9a-zA-Z]{36}",
+    "OpenAI API Key": r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}",
+    "OpenAI API Key (Project)": r"sk-proj-[a-zA-Z0-9]{20,}",
+    "Slack Token": r"xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}",
+    "Generic API Key": r"(?i)(api[_-]?key|apikey)['\"]?\s*[:=]\s*['\"][a-zA-Z0-9]{20,}['\"]",
+    "Generic Secret": r"(?i)(secret|password|passwd|pwd)['\"]?\s*[:=]\s*['\"][^'\"]{8,}['\"]"
+}
+
+# Binary file extensions to skip for content scanning
+BINARY_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp',
+    '.so', '.dll', '.exe', '.bin', '.o', '.a',
+    '.jar', '.war', '.ear', '.class',
+    '.zip', '.tar', '.gz', '.bz2', '.xz', '.7z',
+    '.woff', '.woff2', '.ttf', '.eot',
+    '.pdf', '.doc', '.docx',
+    '.pyc', '.pyo'
+}
+
 
 def parse_image_reference(image_ref):
     """Parse image:tag into (image_name, tag)"""
@@ -87,14 +127,15 @@ def get_manifest(imageName, tag, token):
     return manifest
 
 def scan_layer_stream(layerDigest, token, imageName):
-    """Scan a layer for package database files and application dependency files.
+    """Scan a layer for package database files, application dependency files, and secrets.
     
     Returns:
-        list: List of tuples (content, file_type, metadata)
-              file_type is 'os' or 'app'
-              metadata contains os_type for OS files, or app_type for app files
+        tuple: (findings, secrets)
+            findings: List of tuples (content, file_type, metadata)
+            secrets: List of dicts with 'file' and 'issue' keys
     """
     findings = []
+    secrets = []
     headers = {
         "Authorization": f"Bearer {token}"}
     url = f"{REGISTRY_URL}/library/{imageName}/blobs/{layerDigest}"
@@ -108,44 +149,79 @@ def scan_layer_stream(layerDigest, token, imageName):
                             continue
                         
                         cleanName = member.name.lstrip('./')
+                        filename = os.path.basename(cleanName)
                         
-                        # Check for OS package database files
-                        if cleanName in OS_PACKAGE_FILES:
-                            os_type = OS_PACKAGE_FILES[cleanName]
-                            print(f"\n   Found {os_type} package DB")
-                            f = tar.extractfile(member)
-                            content = f.read().decode('utf-8')
-                            findings.append((content, 'os', os_type))
+                        # === SECRET SCANNING ===
                         
-                        # Check for Python requirements.txt
-                        elif cleanName.endswith('requirements.txt'):
-                            print(f"\n   Found requirements.txt: {cleanName}")
-                            f = tar.extractfile(member)
-                            content = f.read().decode('utf-8')
-                            findings.append((content, 'app', 'python'))
+                        # A. Check for suspicious filenames
+                        for suspicious in SUSPICIOUS_FILENAMES:
+                            if cleanName.endswith(suspicious):
+                                print(f"\n   [SECRET] Suspicious file: {cleanName}")
+                                secrets.append({
+                                    'file': cleanName,
+                                    'issue': 'Suspicious File'
+                                })
+                                break
                         
-                        # Check for Node.js package.json
-                        elif cleanName.endswith('package.json'):
-                            # Skip node_modules package.json files
-                            if 'node_modules' not in cleanName:
-                                print(f"\n   Found package.json: {cleanName}")
+                        # B. Check file content for secret patterns
+                        # Only scan small text files (< 50KB, non-binary)
+                        file_ext = os.path.splitext(cleanName)[1].lower()
+                        if member.size < 50 * 1024 and file_ext not in BINARY_EXTENSIONS:
+                            try:
                                 f = tar.extractfile(member)
-                                content = f.read().decode('utf-8')
-                                findings.append((content, 'app', 'npm'))
-                        
-                        # Check for Go go.mod
-                        elif cleanName.endswith('go.mod'):
-                            print(f"\n   Found go.mod: {cleanName}")
-                            f = tar.extractfile(member)
-                            content = f.read().decode('utf-8')
-                            findings.append((content, 'app', 'go'))
-                        
-                        # Check for Java/Maven pom.xml
-                        elif cleanName.endswith('pom.xml'):
-                            print(f"\n   Found pom.xml: {cleanName}")
-                            f = tar.extractfile(member)
-                            content = f.read().decode('utf-8')
-                            findings.append((content, 'app', 'maven'))
+                                if f:
+                                    content = f.read().decode('utf-8', errors='ignore')
+                                    
+                                    # Check against regex patterns
+                                    for pattern_name, pattern in SECRET_REGEX_PATTERNS.items():
+                                        if re.search(pattern, content):
+                                            print(f"\n   [SECRET] {pattern_name} found in: {cleanName}")
+                                            secrets.append({
+                                                'file': cleanName,
+                                                'issue': f'Regex Match: {pattern_name}'
+                                            })
+                                            # Don't break - continue checking other patterns
+                                    
+                                    # === PACKAGE DETECTION (reuse content if already read) ===
+                                    
+                                    # Check for OS package database files
+                                    if cleanName in OS_PACKAGE_FILES:
+                                        os_type = OS_PACKAGE_FILES[cleanName]
+                                        print(f"\n   Found {os_type} package DB")
+                                        findings.append((content, 'os', os_type))
+                                    
+                                    # Check for Python requirements.txt
+                                    elif cleanName.endswith('requirements.txt'):
+                                        print(f"\n   Found requirements.txt: {cleanName}")
+                                        findings.append((content, 'app', 'python'))
+                                    
+                                    # Check for Node.js package.json
+                                    elif cleanName.endswith('package.json'):
+                                        if 'node_modules' not in cleanName:
+                                            print(f"\n   Found package.json: {cleanName}")
+                                            findings.append((content, 'app', 'npm'))
+                                    
+                                    # Check for Go go.mod
+                                    elif cleanName.endswith('go.mod'):
+                                        print(f"\n   Found go.mod: {cleanName}")
+                                        findings.append((content, 'app', 'go'))
+                                    
+                                    # Check for Java/Maven pom.xml
+                                    elif cleanName.endswith('pom.xml'):
+                                        print(f"\n   Found pom.xml: {cleanName}")
+                                        findings.append((content, 'app', 'maven'))
+                                        
+                            except Exception:
+                                # Skip files that can't be read
+                                pass
+                        else:
+                            # For larger files, still check for package managers but read separately
+                            if cleanName in OS_PACKAGE_FILES:
+                                os_type = OS_PACKAGE_FILES[cleanName]
+                                print(f"\n   Found {os_type} package DB")
+                                f = tar.extractfile(member)
+                                content = f.read().decode('utf-8', errors='ignore')
+                                findings.append((content, 'os', os_type))
                             
         except gzip.BadGzipFile:
             pass
@@ -154,7 +230,7 @@ def scan_layer_stream(layerDigest, token, imageName):
         except requests.RequestException as e:
             print(f"Error: Network error for layer {layerDigest[:12]}: {e}")
 
-    return findings
+    return findings, secrets
 
 
 def parse_apk(content):
@@ -477,18 +553,22 @@ def main():
     layers = manifest['layers']
     print(f"Found {len(layers)} layers")
 
-    # Collect packages from all layers
+    # Collect packages and secrets from all layers
     os_packages = []
     app_packages = []
+    all_secrets = []
     detected_os = None
     
     for layer in reversed(layers):
         digest = layer['digest']
         print(f" > Scanning layer {digest[:12]}.. ", end="", flush=True)
 
-        findings = scan_layer_stream(digest, token, image_name)
+        findings, layer_secrets = scan_layer_stream(digest, token, image_name)
         
-        if not findings:
+        # Collect secrets from this layer
+        all_secrets.extend(layer_secrets)
+        
+        if not findings and not layer_secrets:
             print("(empty)")
             continue
         
@@ -513,18 +593,26 @@ def main():
         print("")
 
     # Build and save the inventory
-    if os_packages or app_packages:
+    if os_packages or app_packages or all_secrets:
         print(f"\n=== Scan Results ===")
         if detected_os:
             print(f"Detected OS: {detected_os}")
             print(f"OS packages found: {len(os_packages)}")
         print(f"App packages found: {len(app_packages)}")
         
-        import json
+        # Report secrets
+        if all_secrets:
+            print(f"\n⚠️  SECRETS DETECTED: {len(all_secrets)}")
+            for secret in all_secrets:
+                print(f"   - {secret['file']}: {secret['issue']}")
+        else:
+            print(f"Secrets found: 0")
+        
         result = {
             "os": detected_os,
             "os_packages": os_packages,
-            "app_packages": app_packages
+            "app_packages": app_packages,
+            "secrets": all_secrets
         }
         with open("inventory.json", "w") as f:
             json.dump(result, f, indent=2)
